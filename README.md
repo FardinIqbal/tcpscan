@@ -165,4 +165,4 @@ pip install scapy cryptography
 
 ## Related Projects
 
-- [Argus](https://github.com/FardinIqbal/argus) - Passive network sniffer with deep packet inspection for HTTP, TLS, and DNS. The passive monitoring counterpart to tcpscan.
+Part of a 5-project security research portfolio: [Secure Vault](https://github.com/FardinIqbal/secure-vault) (password manager), [NetSec Toolkit](https://github.com/FardinIqbal/netsec-toolkit) (certificate analyzer), [Argus](https://github.com/FardinIqbal/argus) (passive network sniffer), [x86 Exploit Lab](https://github.com/FardinIqbal/x86-exploit-lab) (buffer overflow research).
