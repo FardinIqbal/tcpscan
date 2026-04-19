@@ -5,75 +5,44 @@
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-3776AB?logo=python&logoColor=white)
 ![License MIT](https://img.shields.io/badge/license-MIT-green)
 
-After building Argus for passive analysis, the natural next step was active reconnaissance. How does nmap actually fingerprint services? I built tcpscan to find out, and the probe ordering problem (distinguishing TLS from plain TCP when TLS servers are also TCP servers) turned out to be more interesting than I expected.
+A TCP SYN scanner with 6-type service fingerprinting that correctly distinguishes TLS from plain TCP services through ordered probe logic. Dual X.509 certificate extraction with library and raw DER fallback. 2-phase scanning architecture: SYN discovery followed by behavioral probing.
 
-## What It Does
+## What it is
 
-tcpscan performs a two-phase scan against a target host. Phase 1 sends raw TCP SYN packets to each specified port using Scapy and collects SYN-ACK responses to identify open ports. Phase 2 connects to each open port and runs a series of probes in a specific order to classify the service into one of six types, extracting the TLS certificate Common Name when applicable.
+tcpscan is a network reconnaissance tool that operates in two phases. Phase 1 sends raw TCP SYN packets to target ports and identifies which are open by reading SYN-ACK responses. Phase 2 connects to each open port and runs an ordered sequence of probes (TCP banner, TLS banner, HTTP GET, generic probe) to classify the service into one of six types. The key insight: a TLS server is also a TCP server, so TLS probes must be attempted before plain TCP probes — otherwise TLS services are misclassified as plain TCP.
 
-The scanner separates results from progress: scan output goes to stdout and progress messages go to stderr, so results can be piped or redirected cleanly.
+## Key features
 
-## Architecture
+- **Ordered probe logic** — TLS handshake is attempted before plain TCP probes. If the handshake succeeds, only TLS-based probes are used from that point. If it fails, the service is TCP-only. Prevents misclassifying TLS services as plain TCP.
+- **6-type service classification** — TCP server-initiated (banner on connect), TLS server-initiated (banner on TLS), HTTP (GET over TCP), HTTPS (GET over TLS), Generic TCP, Generic TLS.
+- **Dual X.509 certificate extraction** — primary path parses DER-encoded certificates via the `cryptography` library and pulls the Common Name. Fallback path manually searches raw DER bytes for the CN OID sequence (`0x55 0x04 0x03`) when the library fails.
+- **SYN scanning via Scapy** — raw packet crafting, checks for flags `0x12` (SYN-ACK), sends RST to tear down half-open state.
+- **Response sanitization** — non-printable bytes replaced with `.` (matching `tcpdump -A` behavior), capped at 1024 bytes for clean console display.
+- **Flexible port specification** — single ports, ranges, comma-separated lists, or mixed (`22,80-90,443`).
+- **Fresh connection per probe** — try/finally cleanup, 2s timeouts throughout. Informational messages to stderr, results to stdout for scriptability.
 
-```mermaid
-flowchart TD
-    A[Target + Ports] --> B[Phase 1: SYN Scan]
-    B --> C{SYN-ACK?}
-    C -->|No| D[Port Closed]
-    C -->|Yes| E[Send RST]
-    E --> F[Phase 2: Service Fingerprinting]
-    F --> G[TCP Connect + Wait]
-    G -->|Banner received| H[Type 1: TCP Server-Initiated]
-    G -->|No banner| I[TLS Handshake]
-    I -->|Success + Banner| J[Type 2: TLS Server-Initiated]
-    I -->|Success + No Banner| K{Send GET over TLS}
-    K -->|Response| L[Type 4: HTTPS Server]
-    K -->|No response| M[Type 6: Generic TLS]
-    I -->|Failure| N{Send GET over TCP}
-    N -->|Response| O[Type 3: HTTP Server]
-    N -->|No response| P[Type 5: Generic TCP]
-```
+## Quick start
 
-## The Six Service Types
-
-| Type | Name | Detection Method |
-|------|------|-----------------|
-| 1 | TCP server-initiated | Server sends a banner immediately after TCP connect (SSH, FTP, SMTP) |
-| 2 | TLS server-initiated | Server sends data immediately after TLS handshake (IMAPS, POP3S) |
-| 3 | HTTP server | Responds to `GET / HTTP/1.0` over plain TCP |
-| 4 | HTTPS server | Responds to `GET / HTTP/1.0` over TLS |
-| 5 | Generic TCP | Accepts TCP connection but does not respond to banner wait or GET probe |
-| 6 | Generic TLS | Completes TLS handshake but does not respond to GET probe |
-
-## Usage
-
-tcpscan requires root privileges for raw SYN packet transmission.
-
-**Scan default ports** (21, 22, 23, 25, 80, 110, 143, 443, 587, 853, 993, 3389, 8080):
+tcpscan requires **root privileges** for raw SYN packet transmission.
 
 ```bash
+# Install dependencies
+pip install scapy cryptography
+
+# Scan default ports (21, 22, 23, 25, 80, 110, 143, 443, 587, 853, 993, 3389, 8080)
 sudo python3 tcpscan.py 192.168.1.1
-```
 
-**Scan specific ports:**
-
-```bash
+# Scan specific ports
 sudo python3 tcpscan.py -p 22,80,443 github.com
-```
 
-**Scan a range:**
-
-```bash
+# Scan a range
 sudo python3 tcpscan.py -p 1-1024 10.0.0.5
-```
 
-**Mixed specification:**
-
-```bash
+# Mixed specification
 sudo python3 tcpscan.py -p 22,80-90,443,8080 target.example.org
 ```
 
-## Example Output
+Example output:
 
 ```
 Host: github.com:22
@@ -84,56 +53,68 @@ Host: google.com:443
 Type: (4) HTTPS server | CN *.google.com
 Response: HTTP/1.0 200 OK
 Content-Type: text/html; charset=ISO-8859-1
-...
 
 Host: imap.gmail.com:993
 Type: (2) TLS server-initiated | CN imap.gmail.com
 Response: * OK Gimap ready for requests from ...
 ```
 
-## How It Works
+## Architecture
 
-### Phase 1: SYN Scanning
+```
+Target + Ports
+      |
+      v
+Phase 1: SYN Scan (Scapy, raw sockets)
+      |
+      +-- SYN-ACK (flags 0x12) --> Open port list
+      +-- No response / RST ----> Skip
+      |
+      v
+Phase 2: Fingerprinting (per open port)
+      |
+      +-- TCP connect + wait
+      |     +-- Banner received -----> Type 1: TCP server-initiated
+      |     +-- No banner -----------> TLS handshake
+      |                                 +-- Success + banner --> Type 2: TLS server-initiated
+      |                                 +-- Success, TLS GET --> Type 4: HTTPS (response) / Type 6: Generic TLS (none)
+      |                                 +-- Failed, TCP GET ---> Type 3: HTTP (response) / Type 5: Generic TCP (none)
+```
 
-The SYN scan sends a TCP packet with only the SYN flag set to each target port. If the port is open, the OS responds with SYN-ACK (flags `0x12`). tcpscan immediately sends a RST packet to tear down the half-open connection, avoiding a full three-way handshake. This is faster and less visible in logs than a full connect scan, since the connection never completes.
+RST is sent after each SYN-ACK to clean up half-open connections. Raw socket access requires root.
 
-Scapy constructs and sends the raw packets directly, bypassing the kernel's TCP stack. The source port is auto-assigned, and the RST packet uses the sequence number from the SYN-ACK's acknowledgment field so the remote host accepts it.
+### The six service types
 
-### Phase 2: Why Probe Order Matters
+| Type | Name | Detection Method |
+|------|------|-----------------|
+| 1 | TCP server-initiated | Server sends a banner immediately after TCP connect (SSH, FTP, SMTP) |
+| 2 | TLS server-initiated | Server sends data immediately after TLS handshake (IMAPS, POP3S) |
+| 3 | HTTP server | Responds to `GET / HTTP/1.0` over plain TCP |
+| 4 | HTTPS server | Responds to `GET / HTTP/1.0` over TLS |
+| 5 | Generic TCP | Accepts TCP connection but no response to banner wait or GET |
+| 6 | Generic TLS | Completes TLS handshake but no response to GET probe |
 
-The core challenge in service fingerprinting is that every TLS server is also a TCP server. If you send a plain TCP GET probe first, a TLS server will accept the TCP connection but return nothing meaningful (or close it). You have now consumed a connection attempt and learned nothing. Worse, you might classify port 443 as "Generic TCP" when it is actually HTTPS.
+## Tech stack
 
-tcpscan solves this with a specific probe ordering:
-
-1. **TCP connect and wait.** Connect over plain TCP and wait up to 2 seconds for a server-initiated banner. Services like SSH, FTP, and SMTP send their banner immediately after the TCP handshake completes, before the client sends anything. If data arrives, this is Type 1.
-
-2. **TLS handshake.** Attempt a TLS connection with certificate validation disabled (since we are fingerprinting, not authenticating). If the handshake succeeds, we know the port speaks TLS. Wait for a server-initiated banner over the encrypted channel. If data arrives (like an IMAP greeting over TLS), this is Type 2.
-
-3. **Branch based on TLS result.** This is the key decision point:
-   - If TLS succeeded, all subsequent probes use TLS. Send `GET / HTTP/1.0\r\n\r\n` over a new TLS connection. If a response comes back, this is Type 4 (HTTPS). Otherwise, send a generic probe (`\r\n\r\n\r\n\r\n`) over TLS. Whatever happens, this is Type 6 (Generic TLS).
-   - If TLS failed, the port only speaks plain TCP. Send the same GET probe over TCP. If a response comes back, this is Type 3 (HTTP). Otherwise, send the generic probe over TCP. This is Type 5 (Generic TCP).
-
-The ordering guarantees that TLS services are never misclassified as plain TCP. The TLS probe runs before any client-initiated TCP probes, so by the time we try sending data over plain TCP, we already know TLS does not work on that port.
-
-### Dual Certificate Extraction
-
-tcpscan extracts the Common Name (CN) from TLS certificates using two methods. The primary method uses the `cryptography` library to parse the DER-encoded certificate and walk the subject attributes for the `COMMON_NAME` OID. If that library is not installed, a fallback parser scans the raw DER bytes for the CN OID sequence (`0x55 0x04 0x03`), reads the length byte, and decodes the string that follows. This means certificate extraction works even in minimal environments without the cryptography package.
-
-### Response Sanitization
-
-All service responses are sanitized before display. Non-printable bytes are replaced with `.`, matching the behavior of `tcpdump -A`. Printable ASCII (32-126) plus whitespace characters (tab, newline, carriage return) are preserved. Responses are capped at 1024 bytes.
+| Layer | Technology |
+|-------|-----------|
+| Language | Python 3.8+ |
+| Network | Scapy (SYN scanning), `socket` (TCP connections) |
+| TLS | `ssl` module (handshake, cert retrieval) |
+| Cryptography | `cryptography` (X.509 CN extraction) |
+| Binary parsing | `struct` (DER OID fallback) |
 
 ## Testing
 
 tcpscan includes two test harnesses.
 
-**Fingerprint test** (no root required, tests the classification logic against live services):
+**Fingerprint test** (no root required, tests classification logic against live services):
 
 ```bash
 python3 test_fingerprint.py
 ```
 
-This script imports the fingerprinting functions from tcpscan without loading Scapy (patching out the scapy import), then probes real services to verify type classification:
+This imports the fingerprinting functions from `tcpscan` without loading Scapy (patching out the scapy import), then probes real services to verify type classification:
 
 | Target | Port | Expected Type |
 |--------|------|--------------|
@@ -150,19 +131,26 @@ This script imports the fingerprinting functions from tcpscan without loading Sc
 sudo bash run_tests.sh
 ```
 
-This starts tcpdump, runs scans against multiple targets to exercise all six types, and captures the traffic to `test.pcap` for offline analysis.
+Starts `tcpdump`, runs scans against multiple targets to exercise all six types, and captures traffic to `test.pcap` for offline analysis.
 
-## Requirements
+## By the numbers
 
-- Python 3.8+
-- [Scapy](https://scapy.net/) (raw packet construction and SYN scanning)
-- [cryptography](https://cryptography.io/) (optional, certificate CN extraction)
-- Root/sudo privileges (required for raw socket SYN scanning)
+| Metric | Value |
+|--------|-------|
+| Service types fingerprinted | 6 |
+| Scanning phases | 2 (SYN discovery + behavioral probing) |
+| Certificate extraction | Dual strategy (cryptography library + raw DER OID fallback) |
+| Port specification | Single, range, list, or mixed (e.g. `22,80-90,443`) |
+| Response sanitization | Non-printable bytes replaced, capped at 1024 bytes |
+| Timeout per probe | 2 seconds |
+| Default ports scanned | 13 (21, 22, 23, 25, 80, 110, 143, 443, 587, 853, 993, 3389, 8080) |
 
-```bash
-pip install scapy cryptography
-```
-
-## Related Projects
+## Project context
 
 Part of a 5-project security research portfolio: [Secure Vault](https://github.com/FardinIqbal/secure-vault) (password manager), [NetSec Toolkit](https://github.com/FardinIqbal/netsec-toolkit) (certificate analyzer), [Argus](https://github.com/FardinIqbal/argus) (passive network sniffer), [x86 Exploit Lab](https://github.com/FardinIqbal/x86-exploit-lab) (buffer overflow research).
+
+After building Argus for passive analysis, the natural next step was active reconnaissance. The probe ordering problem — distinguishing TLS from plain TCP when TLS servers are also TCP servers — turned out to be more interesting than expected, and is the design hinge of the tool.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
